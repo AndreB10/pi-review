@@ -1,0 +1,183 @@
+import { spawn } from "node:child_process";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  captureChangeSnapshot,
+  isSensitivePath,
+  parsePorcelainV2,
+  type GitExecutor,
+} from "../src/git-snapshot.js";
+
+const temporaryDirectories: string[] = [];
+
+async function makeTemp(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "pi-review-test-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+});
+
+const gitExecutor: GitExecutor = (args, cwd, signal) =>
+  new Promise((resolve, reject) => {
+    const child = spawn("git", args, { cwd, signal, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk.toString()));
+    child.stderr.on("data", (chunk) => (stderr += chunk.toString()));
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ stdout, stderr, code: code ?? 1 }));
+  });
+
+async function git(cwd: string, ...args: string[]): Promise<string> {
+  const result = await gitExecutor(args, cwd);
+  if (result.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  return result.stdout;
+}
+
+async function initializeRepository(directory: string, withCommit = true): Promise<void> {
+  await git(directory, "init", "-b", "main");
+  await git(directory, "config", "user.name", "Pi Review Tests");
+  await git(directory, "config", "user.email", "tests@example.invalid");
+  await git(directory, "config", "commit.gpgsign", "false");
+  if (withCommit) {
+    await writeFile(join(directory, "modified.ts"), "export const value = 1;\n");
+    await writeFile(join(directory, "deleted.ts"), "export const removed = true;\n");
+    await writeFile(join(directory, "rename.ts"), "export const renamed = true;\n");
+    await git(directory, "add", ".");
+    await git(directory, "commit", "-m", "initial");
+  }
+}
+
+describe("parsePorcelainV2", () => {
+  it("parses ordinary, renamed, conflicted, and untracked records with spaces", () => {
+    const hash = "a".repeat(40);
+    const output = [
+      `1 .M N... 100644 100644 100644 ${hash} ${hash} path with spaces.ts`,
+      `2 R. N... 100644 100644 100644 ${hash} ${hash} R100 renamed file.ts`,
+      "old file.ts",
+      `u UU N... 100644 100644 100644 100644 ${hash} ${hash} ${hash} conflict.ts`,
+      "? untracked file.ts",
+      "",
+    ].join("\0");
+
+    expect(parsePorcelainV2(output)).toEqual([
+      {
+        path: "path with spaces.ts",
+        indexStatus: ".",
+        worktreeStatus: "M",
+        kind: "modified",
+      },
+      {
+        path: "renamed file.ts",
+        originalPath: "old file.ts",
+        indexStatus: "R",
+        worktreeStatus: ".",
+        kind: "renamed",
+      },
+      {
+        path: "conflict.ts",
+        indexStatus: "U",
+        worktreeStatus: "U",
+        kind: "conflicted",
+      },
+      {
+        path: "untracked file.ts",
+        indexStatus: "?",
+        worktreeStatus: "?",
+        kind: "untracked",
+      },
+    ]);
+  });
+});
+
+describe("captureChangeSnapshot", () => {
+  it("captures staged, unstaged, untracked, renamed, and deleted changes without mutation", async () => {
+    const directory = await makeTemp();
+    await initializeRepository(directory);
+    await writeFile(join(directory, "modified.ts"), "export const value = 2;\n");
+    await writeFile(join(directory, "staged.ts"), "export const staged = true;\n");
+    await git(directory, "add", "staged.ts");
+    await writeFile(join(directory, "untracked file.ts"), "export const fresh = true;\n");
+    await git(directory, "mv", "rename.ts", "renamed.ts");
+    await rm(join(directory, "deleted.ts"));
+
+    // Prime Git's index refresh before taking the byte-level invariant snapshot.
+    const statusBefore = await git(directory, "status", "--porcelain=v2", "-z", "--untracked-files=all");
+    const indexBefore = await readFile(join(directory, ".git", "index"));
+    const modifiedBefore = await readFile(join(directory, "modified.ts"));
+
+    const snapshot = await captureChangeSnapshot(directory, gitExecutor);
+
+    expect(snapshot.changes.map((change) => change.path).sort()).toEqual(
+      ["deleted.ts", "modified.ts", "renamed.ts", "staged.ts", "untracked file.ts"].sort(),
+    );
+    expect(snapshot.changes.find((change) => change.path === "modified.ts")?.content).toContain("+export const value = 2;");
+    expect(snapshot.changes.find((change) => change.path === "deleted.ts")?.content).toContain("-export const removed");
+    expect(snapshot.changes.find((change) => change.path === "untracked file.ts")?.contentKind).toBe("new-file");
+    expect(snapshot.changes.find((change) => change.path === "renamed.ts")?.originalPath).toBe("rename.ts");
+    expect(snapshot.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+
+    expect(await git(directory, "status", "--porcelain=v2", "-z", "--untracked-files=all")).toBe(statusBefore);
+    expect(await readFile(join(directory, ".git", "index"))).toEqual(indexBefore);
+    expect(await readFile(join(directory, "modified.ts"))).toEqual(modifiedBefore);
+  });
+
+  it("preserves both staged and unstaged layers even when the working tree reverts a staged change", async () => {
+    const directory = await makeTemp();
+    await initializeRepository(directory);
+    await writeFile(join(directory, "modified.ts"), "export const value = 2;\n");
+    await git(directory, "add", "modified.ts");
+    await writeFile(join(directory, "modified.ts"), "export const value = 1;\n");
+
+    const snapshot = await captureChangeSnapshot(directory, gitExecutor);
+    const evidence = snapshot.changes.find((change) => change.path === "modified.ts")?.content ?? "";
+    expect(evidence).toContain("STAGED CHANGES");
+    expect(evidence).toContain("UNSTAGED CHANGES");
+    expect(evidence).toContain("+export const value = 2;");
+    expect(evidence).toContain("+export const value = 1;");
+  });
+
+  it("supports an unborn repository and records binary files and symlinks without following them", async () => {
+    const directory = await makeTemp();
+    await initializeRepository(directory, false);
+    await writeFile(join(directory, "new.ts"), "export const newFile = true;\n");
+    await git(directory, "add", "new.ts");
+    await writeFile(join(directory, "new.ts"), "export const newFile = 'working tree';\n");
+    await writeFile(join(directory, "binary.bin"), Buffer.from([0, 1, 2, 3]));
+    await symlink("/etc/passwd", join(directory, "link"));
+
+    const snapshot = await captureChangeSnapshot(directory, gitExecutor);
+    expect(snapshot.head).toBeNull();
+    const newFileEvidence = snapshot.changes.find((change) => change.path === "new.ts")?.content ?? "";
+    expect(newFileEvidence).toContain("STAGED CHANGES");
+    expect(newFileEvidence).toContain("UNSTAGED CHANGES");
+    expect(newFileEvidence).toContain("newFile");
+    expect(snapshot.changes.find((change) => change.path === "binary.bin")?.contentKind).toBe("binary");
+    expect(snapshot.changes.find((change) => change.path === "link")?.content).toBe("Symlink target: /etc/passwd");
+  });
+
+  it("works from a nested directory", async () => {
+    const directory = await makeTemp();
+    await initializeRepository(directory);
+    await mkdir(join(directory, "src"));
+    await writeFile(join(directory, "src", "nested.ts"), "export {};\n");
+
+    const snapshot = await captureChangeSnapshot(join(directory, "src"), gitExecutor);
+    expect(snapshot.root).toBe(directory);
+    expect(snapshot.changes.map((change) => change.path)).toContain("src/nested.ts");
+  });
+});
+
+describe("sensitive path detection", () => {
+  it("flags likely secret-bearing files without matching ordinary names", () => {
+    expect(isSensitivePath(".env.local")).toBe(true);
+    expect(isSensitivePath("config/client-secret.json")).toBe(true);
+    expect(isSensitivePath("certs/server.pem")).toBe(true);
+    expect(isSensitivePath("src/monkey.ts")).toBe(false);
+  });
+});

@@ -1,0 +1,59 @@
+{
+  "name": "@andre-barbosa/pi-review",
+  "version": "0.1.0",
+  "description": "A read-only two-stage code review extension for pi",
+  "author": "Andre Barbosa",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndreB10/pi-review.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AndreB10/pi-review/issues"
+  },
+  "homepage": "https://github.com/AndreB10/pi-review#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "code-review",
+    "security",
+    "ai"
+  ],
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run check"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.81.1",
+    "@earendil-works/pi-ai": "^0.81.1",
+    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "@earendil-works/pi-tui": "^0.81.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3",
+    "typebox": "^1.1.38",
+    "vitest": "^4.1.9"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
