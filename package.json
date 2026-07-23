@@ -1,6 +1,6 @@
 {
   "name": "@andre-barbosa/pi-review",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A read-only two-stage code review extension for pi",
   "author": "Andre Barbosa",
   "repository": {
