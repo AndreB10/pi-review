@@ -48,14 +48,16 @@ Exact models may be supplied directly:
 
 Model IDs are `provider/model`, so IDs containing additional slashes—such as OpenRouter models—work as expected. In non-interactive modes, both model arguments are required.
 
-Scope a review to uncommitted changes beneath one or more literal, repository-relative paths with repeatable `--path` options:
+Scope a review to uncommitted changes beneath one or more literal paths with repeatable `--path` options. Paths are repository-relative when Pi is inside a Git worktree and working-directory-relative otherwise:
 
 ```text
 /review --path src --path "generated output"
 /review anthropic/claude-sonnet-4-6 openai/gpt-5.4 --path packages/api
 ```
 
-Explicit paths may name files or directories. Under those paths, ignored files are force-included as full current-file evidence, while unchanged tracked files remain excluded.
+Explicit paths may name files or directories. For every existing directory, the extension resolves Git from inside that directory, so nested repositories and multiple repository folders are inspected with their own Git worktrees. Directories that resolve to the same repository are grouped; distinct repositories receive separate two-stage reports. Missing paths and files retain the current repository-relative path-scoped behavior.
+
+Ignored directories are supported even when the directory itself is excluded by `.gitignore`: files beneath every explicit path are force-included as full current-file evidence, while unchanged tracked files remain excluded. When Pi is started outside a Git worktree, `/review --path <folder>` also works for existing folders that contain or belong to Git repositories.
 
 ## Review scope
 
@@ -68,7 +70,7 @@ The captured snapshot includes:
 - additions, modifications, deletions, renames, copies, and conflicts
 - repositories without an initial commit
 
-Without `--path`, all uncommitted changes in the repository are reviewed and ignored files remain excluded. With `--path`, only uncommitted changes beneath the requested paths are included. Binary contents are not sent through the immutable change tool; binary metadata is reported as a review limitation.
+Without `--path`, all uncommitted changes in the current repository are reviewed and ignored files remain excluded. With `--path`, only uncommitted changes beneath the requested paths are included, using the repository discovered from within each existing directory. Binary contents are not sent through the immutable change tool; binary metadata is reported as a review limitation.
 
 Each reviewer receives a fresh agent context with:
 
@@ -80,7 +82,7 @@ Filesystem tools reject paths outside the repository, symlinks escaping the repo
 
 ## Output
 
-The final custom message contains:
+Each final custom message (one per distinct dirty repository) contains:
 
 - snapshot identity and freshness
 - Reviewer 1's complete report
@@ -88,7 +90,7 @@ The final custom message contains:
 - evidence-coverage warnings
 - model IDs and usage information
 
-The message is persisted in Pi's session and participates in future context, but it does **not** trigger another model turn. You can inspect or copy it, ask an agent to fix selected findings later, or make changes manually.
+Reports are persisted in Pi's session and participate in future context, but they do **not** trigger another model turn. You can inspect or copy them, ask an agent to fix selected findings later, or make changes manually.
 
 ## Read-only guarantee
 

@@ -2,7 +2,12 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { BorderedLoader, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown } from "@earendil-works/pi-tui";
-import { captureChangeSnapshot, type GitExecutor } from "./git-snapshot.js";
+import {
+  captureChangeSnapshot,
+  captureRequestedChangeSnapshots,
+  type CapturedChangeSnapshot,
+  type GitExecutor,
+} from "./git-snapshot.js";
 import { modelKey, selectReviewModels } from "./model-selection.js";
 import {
   ADVERSARY_SYSTEM_PROMPT,
@@ -46,19 +51,29 @@ function withLengthWarning(result: ReviewAgentResult): string {
 }
 
 async function confirmDisclosure(
-  snapshot: ChangeSnapshot,
+  snapshots: readonly ChangeSnapshot[],
   reviewer: Model<any>,
   adversary: Model<any>,
   ctx: ExtensionCommandContext,
 ): Promise<boolean> {
   if (!ctx.hasUI) return true;
-  const sensitive = snapshot.changes.filter((change) => change.sensitive).map((change) => change.path);
+  const changeCount = snapshots.reduce((total, snapshot) => total + snapshot.changes.length, 0);
+  const totalBytes = snapshots.reduce((total, snapshot) => total + snapshot.totalBytes, 0);
+  const sensitive = snapshots.flatMap((snapshot) =>
+    snapshot.changes
+      .filter((change) => change.sensitive)
+      .map((change) => (snapshots.length === 1 ? change.path : `${snapshot.root}: ${change.path}`)),
+  );
   const sensitiveText = sensitive.length
     ? `\n\nSensitive-looking changed paths:\n${sensitive.map((path) => `- ${path}`).join("\n")}`
     : "";
+  const repositoryText =
+    snapshots.length > 1
+      ? `\n\nRepositories:\n${snapshots.map((snapshot) => `- ${snapshot.root}`).join("\n")}`
+      : "";
   return ctx.ui.confirm(
     "Send uncommitted code for review?",
-    `${snapshot.changes.length} changed path${snapshot.changes.length === 1 ? "" : "s"} (${Math.ceil(snapshot.totalBytes / 1024)} KiB captured) will be available to:\n- Reviewer 1: ${modelKey(reviewer)}\n- Reviewer 2: ${modelKey(adversary)}${sensitiveText}\n\nThe extension is read-only, but both model providers will receive code and focused repository context.`,
+    `${changeCount} changed path${changeCount === 1 ? "" : "s"} (${Math.ceil(totalBytes / 1024)} KiB captured) will be available to:\n- Reviewer 1: ${modelKey(reviewer)}\n- Reviewer 2: ${modelKey(adversary)}${repositoryText}${sensitiveText}\n\nThe extension is read-only, but both model providers will receive code and focused repository context.`,
   );
 }
 
@@ -74,9 +89,10 @@ async function executeWorkflow(
   ctx: ExtensionCommandContext,
   git: GitExecutor,
   signal: AbortSignal | undefined,
+  progressPrefix = "",
 ): Promise<WorkflowResult> {
   const update = (stage: string, detail: string) => {
-    ctx.ui.setStatus(STATUS_KEY, `${stage}: ${detail}`);
+    ctx.ui.setStatus(STATUS_KEY, `${progressPrefix}${stage}: ${detail}`);
   };
 
   update("Reviewer 1", "starting");
@@ -149,13 +165,13 @@ async function executeWorkflow(
   };
 }
 
-async function runWithProgress(
+async function runWithProgress<T>(
   ctx: ExtensionCommandContext,
-  work: (signal?: AbortSignal) => Promise<WorkflowResult>,
-): Promise<WorkflowResult | undefined> {
+  work: (signal?: AbortSignal) => Promise<T>,
+): Promise<T | undefined> {
   if (ctx.mode !== "tui") return work(undefined);
 
-  type Outcome = { result: WorkflowResult } | { error: unknown };
+  type Outcome = { result: T } | { error: unknown };
   const outcome = await ctx.ui.custom<Outcome | null>((tui, theme, _keybindings, done) => {
     const loader = new BorderedLoader(tui, theme, "Running two-stage read-only code review...");
     let settled = false;
@@ -198,8 +214,13 @@ export default function piReviewExtension(pi: ExtensionAPI) {
         const reviewArguments = parseReviewArguments(args);
         await ctx.waitForIdle();
         ctx.ui.setStatus(STATUS_KEY, "capturing uncommitted changes");
-        const snapshot = await captureChangeSnapshot(ctx.cwd, git, undefined, reviewArguments.paths);
-        if (snapshot.changes.length === 0) {
+        const reviewTargets = (await captureRequestedChangeSnapshots(
+          ctx.cwd,
+          git,
+          undefined,
+          reviewArguments.paths,
+        )).filter((target) => target.snapshot.changes.length > 0);
+        if (reviewTargets.length === 0) {
           notify(
             ctx,
             reviewArguments.paths.length > 0
@@ -215,40 +236,65 @@ export default function piReviewExtension(pi: ExtensionAPI) {
           notify(ctx, "Review cancelled.", "info");
           return;
         }
-        if (!(await confirmDisclosure(snapshot, selected.reviewer, selected.adversary, ctx))) {
-          notify(ctx, "Review cancelled.", "info");
-          return;
-        }
-
-        const workflow = await runWithProgress(ctx, (signal) =>
-          executeWorkflow(
-            snapshot,
-            reviewArguments.paths,
+        if (
+          !(await confirmDisclosure(
+            reviewTargets.map((target) => target.snapshot),
             selected.reviewer,
             selected.adversary,
             ctx,
-            git,
-            signal,
-          ),
-        );
-        if (!workflow) {
+          ))
+        ) {
           notify(ctx, "Review cancelled.", "info");
           return;
         }
 
-        const markdown = buildReportMarkdown(workflow.details);
-        pi.sendMessage({
-          customType: MESSAGE_TYPE,
-          content: markdown,
-          display: true,
-          details: workflow.details,
+        const workflows = await runWithProgress(ctx, async (signal) => {
+          const results: WorkflowResult[] = [];
+          for (let index = 0; index < reviewTargets.length; index += 1) {
+            if (signal?.aborted) throw new Error("Review cancelled.");
+            const target: CapturedChangeSnapshot = reviewTargets[index]!;
+            results.push(
+              await executeWorkflow(
+                target.snapshot,
+                target.scopePaths,
+                selected.reviewer,
+                selected.adversary,
+                ctx,
+                git,
+                signal,
+                reviewTargets.length > 1 ? `Repository ${index + 1}/${reviewTargets.length} · ` : "",
+              ),
+            );
+          }
+          return results;
         });
+        if (!workflows) {
+          notify(ctx, "Review cancelled.", "info");
+          return;
+        }
+
+        for (const workflow of workflows) {
+          const markdown = buildReportMarkdown(workflow.details);
+          pi.sendMessage({
+            customType: MESSAGE_TYPE,
+            content: markdown,
+            display: true,
+            details: workflow.details,
+          });
+        }
+
+        const adversaryFailures = workflows.filter((workflow) => workflow.details.adversary.error).length;
+        const multiple = workflows.length > 1;
         notify(
           ctx,
-          workflow.details.adversary.error
-            ? "Primary review completed, but the adversarial review failed."
-            : "Two-stage code review completed.",
-          workflow.details.adversary.error ? "warning" : "info",
+          adversaryFailures > 0
+            ? multiple
+              ? `${workflows.length} repository reviews completed; the adversarial review failed for ${adversaryFailures}.`
+              : "Primary review completed, but the adversarial review failed."
+            : multiple
+              ? `${workflows.length} two-stage repository reviews completed.`
+              : "Two-stage code review completed.",
+          adversaryFailures > 0 ? "warning" : "info",
         );
       } catch (error) {
         notify(ctx, errorMessage(error), "error");

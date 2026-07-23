@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   captureChangeSnapshot,
+  captureRequestedChangeSnapshots,
   isSensitivePath,
   parsePorcelainV2,
   type GitExecutor,
@@ -216,6 +217,111 @@ describe("captureChangeSnapshot", () => {
     await writeFile(join(directory, "ignored output", "generated.ts"), "export const generated = 2;\n");
     const ignoredChange = await captureChangeSnapshot(directory, gitExecutor, undefined, paths);
     expect(ignoredChange.fingerprint).not.toBe(snapshot.fingerprint);
+  });
+
+  it("uses Git inside an existing child repository", async () => {
+    const directory = await makeTemp();
+    await initializeRepository(directory);
+    const child = join(directory, "child");
+    await mkdir(child);
+    await initializeRepository(child);
+    await git(directory, "add", "child");
+    await git(directory, "commit", "-m", "add child repository");
+    await writeFile(join(child, "modified.ts"), "export const value = 2;\n");
+
+    const calls: Array<{ args: string[]; cwd: string }> = [];
+    const recordingGit: GitExecutor = async (args, cwd, signal) => {
+      calls.push({ args, cwd });
+      return gitExecutor(args, cwd, signal);
+    };
+    const captured = await captureRequestedChangeSnapshots(directory, recordingGit, undefined, ["child"]);
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.snapshot.root).toBe(child);
+    expect(captured[0]?.scopePaths).toEqual(["."]);
+    expect(captured[0]?.snapshot.changes.map((change) => change.path)).toEqual(["modified.ts"]);
+    expect(calls).toContainEqual({ args: ["rev-parse", "--show-toplevel"], cwd: child });
+    expect(calls.some((call) => call.cwd === child && call.args[0] === "status")).toBe(true);
+  });
+
+  it("uses a child repository even when its folder is ignored by the parent", async () => {
+    const directory = await makeTemp();
+    await initializeRepository(directory);
+    await writeFile(join(directory, ".gitignore"), "ignored-repository/\n");
+    await git(directory, "add", ".gitignore");
+    await git(directory, "commit", "-m", "ignore child repository");
+    const child = join(directory, "ignored-repository");
+    await mkdir(child);
+    await initializeRepository(child);
+    await writeFile(join(child, "modified.ts"), "export const value = 2;\n");
+
+    const captured = await captureRequestedChangeSnapshots(directory, gitExecutor, undefined, [
+      "ignored-repository",
+    ]);
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.snapshot.root).toBe(child);
+    expect(captured[0]?.snapshot.changes.map((change) => change.path)).toEqual(["modified.ts"]);
+  });
+
+  it("groups multiple existing folders by their own repositories", async () => {
+    const workspace = await makeTemp();
+    const first = join(workspace, "first");
+    const second = join(workspace, "second");
+    await mkdir(first);
+    await mkdir(second);
+    await initializeRepository(first);
+    await initializeRepository(second);
+    await writeFile(join(first, "modified.ts"), "export const value = 'first';\n");
+    await writeFile(join(second, "modified.ts"), "export const value = 'second';\n");
+
+    const captured = await captureRequestedChangeSnapshots(workspace, gitExecutor, undefined, ["first", "second"]);
+
+    expect(captured.map((target) => target.snapshot.root).sort()).toEqual([first, second].sort());
+    expect(captured.every((target) => target.scopePaths.length === 1 && target.scopePaths[0] === ".")).toBe(true);
+    expect(captured.every((target) => target.snapshot.changes.some((change) => change.path === "modified.ts"))).toBe(
+      true,
+    );
+  });
+
+  it("uses the current path-scoped process for missing folders", async () => {
+    const directory = await makeTemp();
+    await initializeRepository(directory);
+    await mkdir(join(directory, "removed-folder"));
+    await writeFile(join(directory, "removed-folder", "gone.ts"), "export const gone = true;\n");
+    await git(directory, "add", "removed-folder/gone.ts");
+    await git(directory, "commit", "-m", "add removable folder");
+    await rm(join(directory, "removed-folder"), { recursive: true });
+
+    const captured = await captureRequestedChangeSnapshots(directory, gitExecutor, undefined, ["removed-folder"]);
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.snapshot.root).toBe(directory);
+    expect(captured[0]?.scopePaths).toEqual(["removed-folder"]);
+    expect(captured[0]?.snapshot.changes.map((change) => change.path)).toEqual(["removed-folder/gone.ts"]);
+  });
+
+  it("force-includes files when an existing requested folder is ignored", async () => {
+    const directory = await makeTemp();
+    await initializeRepository(directory);
+    await writeFile(join(directory, ".gitignore"), "ignored-folder/\n");
+    await git(directory, "add", ".gitignore");
+    await git(directory, "commit", "-m", "ignore generated folder");
+    await mkdir(join(directory, "ignored-folder"));
+    await writeFile(join(directory, "ignored-folder", "generated.ts"), "export const generated = true;\n");
+
+    const captured = await captureRequestedChangeSnapshots(directory, gitExecutor, undefined, ["ignored-folder"]);
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.snapshot.changes).toEqual([
+      expect.objectContaining({
+        path: "ignored-folder/generated.ts",
+        indexStatus: "!",
+        worktreeStatus: "!",
+        kind: "ignored",
+        contentKind: "new-file",
+      }),
+    ]);
   });
 
   it("rejects explicit review paths outside the repository and through escaping symlinks", async () => {

@@ -127,45 +127,54 @@ function assertInsideRoot(root: string, candidate: string): string {
   throw new Error(`Git reported a path outside the repository: ${JSON.stringify(candidate)}`);
 }
 
+interface NormalizedScopePath {
+  absolute: string;
+  gitPath: string;
+}
+
+async function normalizeScopePath(root: string, requestedPath: string): Promise<NormalizedScopePath> {
+  if (!requestedPath || requestedPath.includes("\0")) {
+    throw new Error(`Invalid review path: ${JSON.stringify(requestedPath)}`);
+  }
+
+  const absolute = resolve(root, requestedPath);
+  if (!isWithinRoot(root, absolute)) {
+    throw new Error(`Review path is outside the repository: ${JSON.stringify(requestedPath)}`);
+  }
+
+  const rel = relative(root, absolute);
+  if (rel === ".git" || rel.startsWith(`.git${sep}`)) {
+    throw new Error("Reviewing .git internals is not allowed.");
+  }
+
+  // Resolve the nearest existing ancestor so a missing path cannot escape through
+  // an existing symlink. Existing symlink scopes that resolve outside are rejected.
+  let existing = absolute;
+  while (true) {
+    try {
+      const canonical = await realpath(existing);
+      if (!isWithinRoot(root, canonical)) {
+        throw new Error(`Review path resolves outside the repository: ${JSON.stringify(requestedPath)}`);
+      }
+      break;
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
+      if (code !== "ENOENT") throw error;
+      const parent = resolve(existing, "..");
+      if (parent === existing) throw error;
+      existing = parent;
+    }
+  }
+
+  return { absolute, gitPath: rel === "" ? "." : rel.split(sep).join("/") };
+}
+
 async function normalizeScopePaths(root: string, requestedPaths: readonly string[]): Promise<string[]> {
   const normalized: string[] = [];
   const seen = new Set<string>();
 
   for (const requestedPath of requestedPaths) {
-    if (!requestedPath || requestedPath.includes("\0")) {
-      throw new Error(`Invalid review path: ${JSON.stringify(requestedPath)}`);
-    }
-
-    const absolute = resolve(root, requestedPath);
-    if (!isWithinRoot(root, absolute)) {
-      throw new Error(`Review path is outside the repository: ${JSON.stringify(requestedPath)}`);
-    }
-
-    const rel = relative(root, absolute);
-    if (rel === ".git" || rel.startsWith(`.git${sep}`)) {
-      throw new Error("Reviewing .git internals is not allowed.");
-    }
-
-    // Resolve the nearest existing ancestor so a missing path cannot escape through
-    // an existing symlink. Existing symlink scopes that resolve outside are rejected.
-    let existing = absolute;
-    while (true) {
-      try {
-        const canonical = await realpath(existing);
-        if (!isWithinRoot(root, canonical)) {
-          throw new Error(`Review path resolves outside the repository: ${JSON.stringify(requestedPath)}`);
-        }
-        break;
-      } catch (error) {
-        const code = error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
-        if (code !== "ENOENT") throw error;
-        const parent = resolve(existing, "..");
-        if (parent === existing) throw error;
-        existing = parent;
-      }
-    }
-
-    const gitPath = rel === "" ? "." : rel.split(sep).join("/");
+    const { gitPath } = await normalizeScopePath(root, requestedPath);
     if (!seen.has(gitPath)) {
       seen.add(gitPath);
       normalized.push(gitPath);
@@ -173,6 +182,102 @@ async function normalizeScopePaths(root: string, requestedPaths: readonly string
   }
 
   return normalized;
+}
+
+async function discoverGitRoot(
+  cwd: string,
+  git: GitExecutor,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const result = await git(["rev-parse", "--show-toplevel"], cwd, signal);
+  if (result.code !== 0) return null;
+  const root = result.stdout.trim();
+  if (!root) throw new Error("Git returned an empty repository root.");
+  return realpath(isAbsolute(root) ? root : resolve(cwd, root));
+}
+
+export interface CapturedChangeSnapshot {
+  snapshot: ChangeSnapshot;
+  /** Literal paths relative to snapshot.root, retained for freshness checks. */
+  scopePaths: string[];
+}
+
+/**
+ * Capture explicit directories from the Git worktree discovered inside each
+ * directory. Distinct child repositories become distinct snapshots; files and
+ * missing paths retain the existing path-scoped behavior in the current repo.
+ */
+export async function captureRequestedChangeSnapshots(
+  cwd: string,
+  git: GitExecutor,
+  signal?: AbortSignal,
+  requestedPaths: readonly string[] = [],
+): Promise<CapturedChangeSnapshot[]> {
+  if (requestedPaths.length === 0) {
+    return [{ snapshot: await captureChangeSnapshot(cwd, git, signal), scopePaths: [] }];
+  }
+
+  const currentRoot = await discoverGitRoot(cwd, git, signal);
+  const base = currentRoot ?? (await realpath(cwd));
+  const targets = new Map<string, string[]>();
+  const fallbackPaths: string[] = [];
+
+  const addTarget = (root: string, scopePath: string) => {
+    const existing = targets.get(root);
+    if (!existing) {
+      targets.set(root, [scopePath]);
+      return;
+    }
+    if (existing.includes(".") || existing.includes(scopePath)) return;
+    if (scopePath === ".") existing.splice(0, existing.length, ".");
+    else existing.push(scopePath);
+  };
+
+  for (const requestedPath of requestedPaths) {
+    const normalized = await normalizeScopePath(base, requestedPath);
+    let directory = false;
+    try {
+      directory = (await lstat(normalized.absolute)).isDirectory();
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
+      if (code !== "ENOENT") throw error;
+    }
+
+    if (directory) {
+      const canonicalDirectory = await realpath(normalized.absolute);
+      const directoryRoot = await discoverGitRoot(canonicalDirectory, git, signal);
+      if (directoryRoot) {
+        if (!isWithinRoot(base, directoryRoot) || !isWithinRoot(directoryRoot, canonicalDirectory)) {
+          throw new Error(`Review path resolves outside the repository: ${JSON.stringify(requestedPath)}`);
+        }
+        const rel = relative(directoryRoot, canonicalDirectory);
+        addTarget(directoryRoot, rel === "" ? "." : rel.split(sep).join("/"));
+        continue;
+      }
+    }
+
+    if (currentRoot) addTarget(currentRoot, normalized.gitPath);
+    else fallbackPaths.push(requestedPath);
+  }
+
+  const captured: CapturedChangeSnapshot[] = [];
+  if (fallbackPaths.length > 0) {
+    // Preserve the previous behavior (and its error) when an explicit path
+    // cannot be resolved through an existing directory repository.
+    captured.push({
+      snapshot: await captureChangeSnapshot(cwd, git, signal, fallbackPaths),
+      scopePaths: [...fallbackPaths],
+    });
+  }
+
+  for (const [root, scopePaths] of targets) {
+    captured.push({
+      snapshot: await captureChangeSnapshot(root, git, signal, scopePaths),
+      scopePaths: [...scopePaths],
+    });
+  }
+
+  return captured;
 }
 
 function isBinaryBuffer(buffer: Buffer): boolean {
@@ -301,13 +406,9 @@ export async function captureChangeSnapshot(
   signal?: AbortSignal,
   requestedPaths: readonly string[] = [],
 ): Promise<ChangeSnapshot> {
-  const rootResult = await git(["rev-parse", "--show-toplevel"], cwd, signal);
-  if (rootResult.code !== 0) throw new Error("/review must be run inside a Git working tree.");
-  const root = rootResult.stdout.trim();
-  if (!root) throw new Error("Git returned an empty repository root.");
-
   // Resolve the repository itself, but do not resolve changed-file symlinks.
-  const canonicalRoot = await realpath(root);
+  const canonicalRoot = await discoverGitRoot(cwd, git, signal);
+  if (!canonicalRoot) throw new Error("/review must be run inside a Git working tree.");
   const scopePaths = await normalizeScopePaths(canonicalRoot, requestedPaths);
   const literalPathspecs = scopePaths.map((path) => `:(literal)${path}`);
   const headResult = await git(["rev-parse", "--verify", "HEAD"], canonicalRoot, signal);

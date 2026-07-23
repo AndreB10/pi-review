@@ -32,7 +32,9 @@ export function buildReportMarkdown(details: ReviewReportDetails): string {
 
   return `# Two-stage code review
 
-${stale}**Snapshot:** \`${details.snapshot.fingerprint.slice(0, 12)}\` · ${details.snapshot.changedFiles.length} changed path${details.snapshot.changedFiles.length === 1 ? "" : "s"} · base \`${details.snapshot.head?.slice(0, 12) ?? "unborn"}\`
+${stale}**Repository:** \`${details.snapshot.root}\`
+
+**Snapshot:** \`${details.snapshot.fingerprint.slice(0, 12)}\` · ${details.snapshot.changedFiles.length} changed path${details.snapshot.changedFiles.length === 1 ? "" : "s"} · base \`${details.snapshot.head?.slice(0, 12) ?? "unborn"}\`
 
 ## Reviewer 1 — ${details.reviewer.model}
 ${coverageWarning(details.reviewer.missingCoverage)}
