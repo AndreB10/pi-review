@@ -38,7 +38,7 @@ Run inside a Git working tree:
 /review
 ```
 
-Pi prompts for the primary and adversarial models, then confirms which providers will receive the code. Authenticated models from `ctx.modelRegistry` are available; use `/login` to add credentials.
+Pi prompts for the primary and adversarial models with compact, searchable selectors, then confirms which providers will receive the code. Type to fuzzy-filter by provider, model ID, or display name. Authenticated models from `ctx.modelRegistry` are available; use `/login` to add credentials.
 
 Exact models may be supplied directly:
 
