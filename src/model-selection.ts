@@ -25,12 +25,6 @@ export function modelKey(model: Model<any>): string {
   return `${model.provider}/${model.id}`;
 }
 
-function parseArguments(args: string): string[] {
-  const parts = args.trim() ? args.trim().split(/\s+/) : [];
-  if (parts.length > 2) throw new Error("Usage: /review [reviewer-provider/model] [adversary-provider/model]");
-  return parts;
-}
-
 function labelFor(model: Model<any>): string {
   const name = model.name && model.name !== model.id ? ` — ${model.name}` : "";
   return `${modelKey(model)}${name} (${Math.round(model.contextWindow / 1000)}k context)`;
@@ -231,10 +225,9 @@ async function chooseModel(
 }
 
 export async function selectReviewModels(
-  args: string,
+  supplied: readonly string[],
   ctx: ExtensionCommandContext,
 ): Promise<SelectedReviewModels | undefined> {
-  const supplied = parseArguments(args);
   await ctx.modelRegistry.refresh();
   const currentKey = ctx.model ? modelKey(ctx.model) : undefined;
   const models = ctx.modelRegistry

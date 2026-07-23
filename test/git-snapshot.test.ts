@@ -171,6 +171,69 @@ describe("captureChangeSnapshot", () => {
     expect(snapshot.root).toBe(directory);
     expect(snapshot.changes.map((change) => change.path)).toContain("src/nested.ts");
   });
+
+  it("scopes uncommitted changes and force-includes ignored files only for explicit paths", async () => {
+    const directory = await makeTemp();
+    await initializeRepository(directory);
+    await mkdir(join(directory, "src"));
+    await mkdir(join(directory, "other"));
+    await mkdir(join(directory, "ignored output"));
+    await writeFile(join(directory, ".gitignore"), "ignored output/\n");
+    await writeFile(join(directory, "src", "changed.ts"), "export const scoped = 1;\n");
+    await writeFile(join(directory, "src", "unchanged.ts"), "export const unchanged = true;\n");
+    await writeFile(join(directory, "src", "deleted.ts"), "export const deleted = true;\n");
+    await writeFile(join(directory, "other", "changed.ts"), "export const other = 1;\n");
+    await git(directory, "add", ".");
+    await git(directory, "commit", "-m", "add scoped fixtures");
+
+    await writeFile(join(directory, "src", "changed.ts"), "export const scoped = 2;\n");
+    await writeFile(join(directory, "src", "new.ts"), "export const fresh = true;\n");
+    await rm(join(directory, "src", "deleted.ts"));
+    await writeFile(join(directory, "other", "changed.ts"), "export const other = 2;\n");
+    await writeFile(join(directory, "ignored output", "generated.ts"), "export const generated = 1;\n");
+
+    const unscoped = await captureChangeSnapshot(directory, gitExecutor);
+    expect(unscoped.changes.map((change) => change.path)).not.toContain("ignored output/generated.ts");
+
+    const paths = ["src", "ignored output"];
+    const snapshot = await captureChangeSnapshot(directory, gitExecutor, undefined, paths);
+    expect(snapshot.changes.map((change) => change.path).sort()).toEqual(
+      ["ignored output/generated.ts", "src/changed.ts", "src/deleted.ts", "src/new.ts"].sort(),
+    );
+    expect(snapshot.changes.map((change) => change.path)).not.toContain("src/unchanged.ts");
+    expect(snapshot.changes.map((change) => change.path)).not.toContain("other/changed.ts");
+    expect(snapshot.changes.find((change) => change.path === "ignored output/generated.ts")).toMatchObject({
+      indexStatus: "!",
+      worktreeStatus: "!",
+      kind: "ignored",
+      contentKind: "new-file",
+    });
+
+    await writeFile(join(directory, "other", "changed.ts"), "export const other = 3;\n");
+    const unrelatedChange = await captureChangeSnapshot(directory, gitExecutor, undefined, paths);
+    expect(unrelatedChange.fingerprint).toBe(snapshot.fingerprint);
+
+    await writeFile(join(directory, "ignored output", "generated.ts"), "export const generated = 2;\n");
+    const ignoredChange = await captureChangeSnapshot(directory, gitExecutor, undefined, paths);
+    expect(ignoredChange.fingerprint).not.toBe(snapshot.fingerprint);
+  });
+
+  it("rejects explicit review paths outside the repository and through escaping symlinks", async () => {
+    const directory = await makeTemp();
+    const outside = await makeTemp();
+    await initializeRepository(directory);
+    await symlink(outside, join(directory, "outside-link"));
+
+    await expect(captureChangeSnapshot(directory, gitExecutor, undefined, ["../outside"])).rejects.toThrow(
+      "outside the repository",
+    );
+    await expect(captureChangeSnapshot(directory, gitExecutor, undefined, ["outside-link"])).rejects.toThrow(
+      "resolves outside the repository",
+    );
+    await expect(captureChangeSnapshot(directory, gitExecutor, undefined, [".git"])).rejects.toThrow(
+      ".git internals",
+    );
+  });
 });
 
 describe("sensitive path detection", () => {

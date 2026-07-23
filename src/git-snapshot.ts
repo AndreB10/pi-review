@@ -116,11 +116,63 @@ export function isSensitivePath(path: string): boolean {
   );
 }
 
+function isWithinRoot(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
 function assertInsideRoot(root: string, candidate: string): string {
   const absolute = resolve(root, candidate);
-  const rel = relative(root, absolute);
-  if (rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel))) return absolute;
+  if (isWithinRoot(root, absolute)) return absolute;
   throw new Error(`Git reported a path outside the repository: ${JSON.stringify(candidate)}`);
+}
+
+async function normalizeScopePaths(root: string, requestedPaths: readonly string[]): Promise<string[]> {
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+
+  for (const requestedPath of requestedPaths) {
+    if (!requestedPath || requestedPath.includes("\0")) {
+      throw new Error(`Invalid review path: ${JSON.stringify(requestedPath)}`);
+    }
+
+    const absolute = resolve(root, requestedPath);
+    if (!isWithinRoot(root, absolute)) {
+      throw new Error(`Review path is outside the repository: ${JSON.stringify(requestedPath)}`);
+    }
+
+    const rel = relative(root, absolute);
+    if (rel === ".git" || rel.startsWith(`.git${sep}`)) {
+      throw new Error("Reviewing .git internals is not allowed.");
+    }
+
+    // Resolve the nearest existing ancestor so a missing path cannot escape through
+    // an existing symlink. Existing symlink scopes that resolve outside are rejected.
+    let existing = absolute;
+    while (true) {
+      try {
+        const canonical = await realpath(existing);
+        if (!isWithinRoot(root, canonical)) {
+          throw new Error(`Review path resolves outside the repository: ${JSON.stringify(requestedPath)}`);
+        }
+        break;
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error ? String(error.code) : undefined;
+        if (code !== "ENOENT") throw error;
+        const parent = resolve(existing, "..");
+        if (parent === existing) throw error;
+        existing = parent;
+      }
+    }
+
+    const gitPath = rel === "" ? "." : rel.split(sep).join("/");
+    if (!seen.has(gitPath)) {
+      seen.add(gitPath);
+      normalized.push(gitPath);
+    }
+  }
+
+  return normalized;
 }
 
 function isBinaryBuffer(buffer: Buffer): boolean {
@@ -247,6 +299,7 @@ export async function captureChangeSnapshot(
   cwd: string,
   git: GitExecutor,
   signal?: AbortSignal,
+  requestedPaths: readonly string[] = [],
 ): Promise<ChangeSnapshot> {
   const rootResult = await git(["rev-parse", "--show-toplevel"], cwd, signal);
   if (rootResult.code !== 0) throw new Error("/review must be run inside a Git working tree.");
@@ -255,26 +308,57 @@ export async function captureChangeSnapshot(
 
   // Resolve the repository itself, but do not resolve changed-file symlinks.
   const canonicalRoot = await realpath(root);
+  const scopePaths = await normalizeScopePaths(canonicalRoot, requestedPaths);
+  const literalPathspecs = scopePaths.map((path) => `:(literal)${path}`);
   const headResult = await git(["rev-parse", "--verify", "HEAD"], canonicalRoot, signal);
   const head = headResult.code === 0 ? headResult.stdout.trim() : null;
 
-  const statusResult = await git(
-    ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
-    canonicalRoot,
-    signal,
-  );
+  const statusArgs = [
+    "status",
+    "--porcelain=v2",
+    "-z",
+    "--untracked-files=all",
+    ...(literalPathspecs.length > 0 ? ["--", ...literalPathspecs] : []),
+  ];
+  const statusResult = await git(statusArgs, canonicalRoot, signal);
   if (statusResult.code !== 0) {
     throw new Error(`Unable to inspect Git status: ${statusResult.stderr.trim() || `git exited ${statusResult.code}`}`);
   }
 
   const entries = parsePorcelainV2(statusResult.stdout);
+  if (literalPathspecs.length > 0) {
+    const ignoredResult = await git(
+      ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", ...literalPathspecs],
+      canonicalRoot,
+      signal,
+    );
+    if (ignoredResult.code !== 0) {
+      throw new Error(
+        `Unable to inspect ignored files: ${ignoredResult.stderr.trim() || `git exited ${ignoredResult.code}`}`,
+      );
+    }
+
+    const seenPaths = new Set(entries.map((entry) => entry.path));
+    for (const path of ignoredResult.stdout.split("\0")) {
+      if (!path || seenPaths.has(path)) continue;
+      assertInsideRoot(canonicalRoot, path);
+      entries.push({
+        path,
+        indexStatus: "!",
+        worktreeStatus: "!",
+        kind: "ignored",
+      });
+      seenPaths.add(path);
+    }
+  }
+
   const changes: ChangeEvidence[] = [];
   let totalBytes = 0;
 
   for (const entry of entries) {
     if (signal?.aborted) throw new Error("Review cancelled.");
     const evidence =
-      entry.kind === "untracked"
+      entry.kind === "untracked" || entry.kind === "ignored"
         ? await captureCurrentFile(canonicalRoot, entry)
         : await captureTrackedPatch(canonicalRoot, head, entry, git, signal);
 

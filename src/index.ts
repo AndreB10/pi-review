@@ -11,6 +11,7 @@ import {
   REVIEWER_SYSTEM_PROMPT,
 } from "./prompts.js";
 import { buildReportMarkdown } from "./report.js";
+import { parseReviewArguments } from "./review-arguments.js";
 import { runReviewAgent } from "./review-agent.js";
 import type { ChangeSnapshot, ReviewAgentResult, ReviewReportDetails } from "./types.js";
 
@@ -67,6 +68,7 @@ interface WorkflowResult {
 
 async function executeWorkflow(
   snapshot: ChangeSnapshot,
+  reviewPaths: readonly string[],
   reviewerModel: Model<any>,
   adversaryModel: Model<any>,
   ctx: ExtensionCommandContext,
@@ -110,7 +112,7 @@ async function executeWorkflow(
   update("Review", "checking snapshot freshness");
   let stale = true;
   try {
-    const current = await captureChangeSnapshot(snapshot.root, git, signal);
+    const current = await captureChangeSnapshot(snapshot.root, git, signal, reviewPaths);
     stale = current.fingerprint !== snapshot.fingerprint;
   } catch {
     // If freshness cannot be proven, the report is conservatively marked stale.
@@ -189,19 +191,26 @@ export default function piReviewExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("review", {
-    description: "Run a read-only primary and adversarial review of all uncommitted changes",
+    description: "Run a read-only primary and adversarial review of uncommitted changes",
     handler: async (args, ctx) => {
       const git = createGitExecutor(pi);
       try {
+        const reviewArguments = parseReviewArguments(args);
         await ctx.waitForIdle();
         ctx.ui.setStatus(STATUS_KEY, "capturing uncommitted changes");
-        const snapshot = await captureChangeSnapshot(ctx.cwd, git);
+        const snapshot = await captureChangeSnapshot(ctx.cwd, git, undefined, reviewArguments.paths);
         if (snapshot.changes.length === 0) {
-          notify(ctx, "No staged, unstaged, or untracked changes to review.", "info");
+          notify(
+            ctx,
+            reviewArguments.paths.length > 0
+              ? "No uncommitted changes found under the requested paths."
+              : "No staged, unstaged, or untracked changes to review.",
+            "info",
+          );
           return;
         }
 
-        const selected = await selectReviewModels(args, ctx);
+        const selected = await selectReviewModels(reviewArguments.modelIds, ctx);
         if (!selected) {
           notify(ctx, "Review cancelled.", "info");
           return;
@@ -212,7 +221,15 @@ export default function piReviewExtension(pi: ExtensionAPI) {
         }
 
         const workflow = await runWithProgress(ctx, (signal) =>
-          executeWorkflow(snapshot, selected.reviewer, selected.adversary, ctx, git, signal),
+          executeWorkflow(
+            snapshot,
+            reviewArguments.paths,
+            selected.reviewer,
+            selected.adversary,
+            ctx,
+            git,
+            signal,
+          ),
         );
         if (!workflow) {
           notify(ctx, "Review cancelled.", "info");

@@ -48,6 +48,15 @@ Exact models may be supplied directly:
 
 Model IDs are `provider/model`, so IDs containing additional slashes—such as OpenRouter models—work as expected. In non-interactive modes, both model arguments are required.
 
+Scope a review to uncommitted changes beneath one or more literal, repository-relative paths with repeatable `--path` options:
+
+```text
+/review --path src --path "generated output"
+/review anthropic/claude-sonnet-4-6 openai/gpt-5.4 --path packages/api
+```
+
+Explicit paths may name files or directories. Under those paths, ignored files are force-included as full current-file evidence, while unchanged tracked files remain excluded.
+
 ## Review scope
 
 The captured snapshot includes:
@@ -55,10 +64,11 @@ The captured snapshot includes:
 - staged changes (`HEAD` to index)
 - unstaged changes (index to working tree)
 - untracked, non-ignored files
+- ignored files only beneath an explicit `--path`
 - additions, modifications, deletions, renames, copies, and conflicts
 - repositories without an initial commit
 
-Binary contents are not sent through the immutable change tool. Binary metadata is reported as a review limitation. Ignored files are not included.
+Without `--path`, all uncommitted changes in the repository are reviewed and ignored files remain excluded. With `--path`, only uncommitted changes beneath the requested paths are included. Binary contents are not sent through the immutable change tool; binary metadata is reported as a review limitation.
 
 Each reviewer receives a fresh agent context with:
 
@@ -100,4 +110,4 @@ npm test
 npm run check
 ```
 
-The tests cover Git snapshot behavior, unborn repositories, staged and unstaged layers, untracked and binary files, symlinks, path confinement, immutable evidence paging, context limits, adversarial handoff, report rendering, and repository invariance.
+The tests cover Git snapshot behavior, unborn repositories, staged and unstaged layers, path-scoped and ignored files, untracked and binary files, symlinks, path confinement, immutable evidence paging, context limits, adversarial handoff, report rendering, and repository invariance.

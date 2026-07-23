@@ -1,6 +1,14 @@
 import type { Usage } from "@earendil-works/pi-ai";
 
-export type ChangeKind = "added" | "modified" | "deleted" | "renamed" | "copied" | "conflicted" | "untracked";
+export type ChangeKind =
+  | "added"
+  | "modified"
+  | "deleted"
+  | "renamed"
+  | "copied"
+  | "conflicted"
+  | "untracked"
+  | "ignored";
 
 export interface StatusEntry {
   path: string;
